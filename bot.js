@@ -89,14 +89,25 @@ const sendMessage = (chatId, text) =>
   tgCall("sendMessage", { chat_id: chatId, text, disable_web_page_preview: true });
 
 // ---------- Gemini / Claude ----------
-async function callGemini(prompt) {
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+
+async function callGemini(prompt, attempt = 1) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`;
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
   });
-  if (!res.ok) throw new Error(`Gemini call failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) {
+    const body = await res.text();
+    if (RETRYABLE_STATUS.has(res.status) && attempt < 3) {
+      const delay = attempt * 1500; // 1.5s, then 3s
+      console.error(`Gemini ${res.status} (attempt ${attempt}), retrying in ${delay}ms...`);
+      await new Promise((r) => setTimeout(r, delay));
+      return callGemini(prompt, attempt + 1);
+    }
+    throw new Error(`Gemini call failed after ${attempt} attempt(s): ${res.status} ${body}`);
+  }
   const data = await res.json();
   return (data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
 }
@@ -499,24 +510,30 @@ async function handleUpdate(update) {
     return;
   }
 
-  if (text === "/start") {
-    await sendMessage(
-      chatId,
-      "Skinstinct content bot is live. Send a note — if it scores high enough it drafts immediately, no extra step.\n\n" +
-        "/revise <feedback> — adjust the last draft\n/score [text] — check a score without drafting\n" +
-        "/queue — any notes stuck without a draft\n/status — recent activity\n\nNothing publishes without you."
-    );
-    return;
-  }
-  if (text === "/queue") return handleQueueCommand(chatId);
-  if (text === "/draft") return handleDraftCommand(chatId);
-  if (text.startsWith("/revise")) return handleReviseCommand(chatId, text.replace(/^\/revise\s*/i, "").trim());
-  if (text.startsWith("/score")) return handleScoreCommand(chatId, text.replace(/^\/score\s*/i, "").trim());
-  if (text === "/status") return handleStatusCommand(chatId);
-  if (/^APPROVE$/i.test(text)) return handleApproveReject(chatId, "approved");
-  if (/^REJECT$/i.test(text)) return handleApproveReject(chatId, "rejected");
+  try {
+    if (text === "/start") {
+      await sendMessage(
+        chatId,
+        "Skinstinct content bot is live. Send a note — if it scores high enough it drafts immediately, no extra step.\n\n" +
+          "/revise <feedback> — adjust the last draft\n/score [text] — check a score without drafting\n" +
+          "/queue — any notes stuck without a draft\n/status — recent activity\n\nNothing publishes without you."
+      );
+      return;
+    }
+    if (text === "/queue") return await handleQueueCommand(chatId);
+    if (text === "/draft") return await handleDraftCommand(chatId);
+    if (text.startsWith("/revise")) return await handleReviseCommand(chatId, text.replace(/^\/revise\s*/i, "").trim());
+    if (text.startsWith("/score")) return await handleScoreCommand(chatId, text.replace(/^\/score\s*/i, "").trim());
+    if (text === "/status") return await handleStatusCommand(chatId);
+    if (/^APPROVE$/i.test(text)) return await handleApproveReject(chatId, "approved");
+    if (/^REJECT$/i.test(text)) return await handleApproveReject(chatId, "rejected");
 
-  return handleNote(chatId, text);
+    return await handleNote(chatId, text);
+  } catch (e) {
+    // The user must never be left with silence — always tell them something broke.
+    console.error(`[${chatId}] handler failed:`, e.message);
+    await sendMessage(chatId, `Something went wrong processing that (${e.message.slice(0, 120)}). Try again in a moment.`).catch(() => {});
+  }
 }
 
 // ---------- long-polling loop ----------
