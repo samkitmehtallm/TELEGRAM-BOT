@@ -9,20 +9,34 @@ reviewer.**
 
 ## How it works
 
-1. Send any plain-text note → scored 0–10 across five criteria (specificity,
-   mechanism, territory alignment, brand grounding, reader value).
-2. Score ≥ `QUEUE_THRESHOLD` (default 7) → drafted immediately: a relevant news
-   angle is looked for (ignored if it doesn't genuinely fit), the post is drafted
-   in Meera's voice, and it's run through style checks (word count 350–600, no
-   hashtags, no exclamation marks, no wellness-marketing jargon, British/Indian
-   spelling). Failed checks are listed under the draft. No weekly limit.
-   Score < threshold → rejected with a one-line reason, nothing drafted.
-3. `/revise <feedback>` — redrafts the last post with that feedback applied.
-4. `/score [text]` — dry-run a score without drafting.
-5. `/queue` — lists any notes that scored high enough but, unusually, didn't
-   auto-draft (e.g. a transient error) — `/draft` picks up from there manually.
-6. `/status` — drafts sent this week, current threshold/model.
-7. Reply `APPROVE` / `REJECT` to log a decision on the latest draft.
+Send any note — raw, half-formed, a musing you haven't worked out yet. **Every note
+produces a post.** The pipeline:
+
+1. **Scrape sources** — three search queries are generated from the note (the topic
+   itself, the wider industry/regulatory angle, the India-market angle) and each is
+   run against Google News, collecting several candidates.
+2. **Draft** — the post is written in Meera's voice, citing whichever sources
+   genuinely strengthen it. If the note is an unresolved musing, the drafter picks
+   the sharpest publishable angle inside it and commits to it.
+3. **Style checks** — word count 350–600, no hashtags, no exclamation marks, no
+   wellness-marketing jargon, British/Indian spelling. Failures are listed under
+   the draft. A banned phrase Meera used in her own note isn't flagged — she's
+   discussing the term deliberately.
+4. **Score the draft** — 0–10 on three founder criteria:
+   - **source validation** — are the claims verifiable, backed by her documented
+     practice or a cited source?
+   - **context** — is it situated in the real current landscape (Indian market,
+     regulation, category dynamics)?
+   - **brand recall** — would a reader come away remembering Meera and Skinstinct
+     specifically, not generic industry commentary?
+
+   The score grades the output. **It never blocks it.**
+5. Every source found is listed under the post — cited or not — with a verify
+   warning, because she publishes under her own name.
+
+Commands: `/revise <feedback>` redrafts the last post · `/score <text>` scores any
+text you wrote yourself · `/status` recent activity · `APPROVE`/`REJECT` logs a
+decision on the latest draft.
 
 ## Files
 

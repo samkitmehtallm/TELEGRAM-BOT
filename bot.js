@@ -1,6 +1,7 @@
 // Skinstinct content bot — Telegram long-polling bot for Meera.
-// A note IS the trigger: it's scored on a 5-criteria rubric, and if it qualifies,
-// drafted immediately in Meera's voice — no separate /draft step, no cap.
+// A note IS the trigger. Every note gets a post: sources are scraped, a draft is written
+// in her voice, style rules are checked, and the finished draft is scored on source
+// validation, context and brand recall. The score grades the output — it never blocks it.
 // Nothing ever reaches LinkedIn from here — Meera is always the final reviewer.
 
 import { readFileSync, realpathSync } from "fs";
@@ -16,12 +17,15 @@ const DRAFT_PROVIDER = (process.env.DRAFT_PROVIDER || "gemini").toLowerCase();
 // Ordered fallback chain. The "-latest" aliases get congested in bursts (503) and the
 // free tier exhausts quota on pro models (429) — so a single model is a single point of
 // failure. Tried in order; first one that answers wins.
-const GEMINI_MODELS = (process.env.GEMINI_MODELS || "gemini-flash-latest,gemini-flash-lite-latest")
+const GEMINI_MODELS = (
+  process.env.GEMINI_MODELS ||
+  "gemini-flash-latest,gemini-3.6-flash,gemini-3.1-flash-lite,gemini-flash-lite-latest"
+)
   .split(",")
   .map((m) => m.trim())
   .filter(Boolean);
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-5";
-const QUEUE_THRESHOLD = Number(process.env.QUEUE_THRESHOLD || 7); // out of 10 — drafts immediately once met, no cap
+const SOURCES_PER_QUERY = Number(process.env.SOURCES_PER_QUERY || 3);
 const MIN_WORDS = 350;
 const MAX_WORDS = 600;
 
@@ -95,6 +99,35 @@ async function tgCall(method, params = {}) {
 const sendMessage = (chatId, text) =>
   tgCall("sendMessage", { chat_id: chatId, text, disable_web_page_preview: true });
 
+// Telegram rejects anything over 4096 characters outright, and a draft plus its source
+// list routinely exceeds that — so split on paragraph boundaries and send in order.
+const TG_MAX_CHARS = 3900;
+
+async function sendLongMessage(chatId, text) {
+  if (text.length <= TG_MAX_CHARS) return sendMessage(chatId, text);
+
+  const chunks = [];
+  let current = "";
+  for (const para of text.split("\n\n")) {
+    const candidate = current ? `${current}\n\n${para}` : para;
+    if (candidate.length > TG_MAX_CHARS) {
+      if (current) chunks.push(current);
+      // A single paragraph longer than the limit still has to be cut somewhere.
+      if (para.length > TG_MAX_CHARS) {
+        for (let i = 0; i < para.length; i += TG_MAX_CHARS) chunks.push(para.slice(i, i + TG_MAX_CHARS));
+        current = "";
+      } else {
+        current = para;
+      }
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) chunks.push(current);
+
+  for (const chunk of chunks) await sendMessage(chatId, chunk);
+}
+
 // ---------- Gemini / Claude ----------
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 
@@ -163,98 +196,139 @@ async function callClaude(prompt, maxTokens = 1400) {
   return (data?.content?.[0]?.text || "").trim();
 }
 
-// ---------- scoring: 5 criteria x 2 points ----------
-async function scoreNote(text) {
-  const prompt = `Score this raw founder note from Meera (Skinstinct, a formulation-first skincare brand) on FIVE criteria, 0-2 points each, for whether it's worth developing into a LinkedIn post. Be strict — most notes should NOT max out.
+// ---------- scoring ----------
+// Scores the PRODUCED DRAFT, not the incoming note. A note is never rejected — every
+// note gets a post. The score tells Meera how strong the post is on the three things
+// that matter when publishing under her own name as a founder.
+async function scoreDraft(draft, sources = []) {
+  const sourceList = sources.length
+    ? sources.map((s, i) => `[${i + 1}] ${s.title} — ${s.source} (${s.date})`).join("\n")
+    : "(no external sources were found for this post)";
 
-1. specificity — concrete numbers, incidents, names, dates vs. vague generalities
-2. mechanism — explains WHY something happens (chemistry, process, cause), not just WHAT happened
-3. territory_alignment — fits Meera's known subjects: formulation chemistry, pH, sourcing/supplier verification, batch QC, India-market/climate context, industry transparency (not generic business or lifestyle content)
-4. brand_grounding — grounded in Skinstinct's own actual practice/experience, not generic advice anyone could give
-5. reader_value — gives the reader something concrete to do or ask, not just an anecdote
+  const prompt = `Score this LinkedIn post drafted for Meera Pillai, founder of Skinstinct (a formulation-first skincare brand), on THREE criteria, 0-10 each.
+
+1. source_validation — are the factual claims verifiable and properly supported? Claims backed by her own documented practice (batch data, CoA, stability testing, supplier logs) or by a cited source score high. Unsupported assertions, invented numbers, or vague appeals to "studies" score low.
+2. context — does the post situate its point in the real current landscape (Indian market conditions, regulation, category dynamics, what the industry actually does) rather than floating free of time and place?
+3. brand_recall — would a reader come away remembering Meera and Skinstinct specifically? Her voice (precise, calibrated, self-implicating, anti-marketing) and her positioning should be unmistakable. Generic industry commentary anyone could have written scores low.
+
+SOURCES AVAILABLE TO THE POST:
+${sourceList}
+
+POST:
+"""
+${draft}
+"""
 
 Respond with ONLY this JSON, no markdown fences:
-{"specificity":0-2,"mechanism":0-2,"territory_alignment":0-2,"brand_grounding":0-2,"reader_value":0-2,"reason":"<one line>"}
+{"source_validation":0-10,"context":0-10,"brand_recall":0-10,"reason":"<one line naming the weakest criterion and how to lift it>"}`;
 
-NOTE:
-"""
-${text}
-"""`;
   const raw = await callGemini(prompt);
   const cleaned = raw.replace(/```json|```/g, "").trim();
   let c;
   try {
     c = JSON.parse(cleaned);
   } catch {
-    c = { specificity: 0, mechanism: 0, territory_alignment: 0, brand_grounding: 0, reader_value: 0, reason: "Could not parse score — treated as 0." };
+    c = { source_validation: 0, context: 0, brand_recall: 0, reason: "Could not parse score." };
   }
-  const total =
-    (c.specificity || 0) + (c.mechanism || 0) + (c.territory_alignment || 0) + (c.brand_grounding || 0) + (c.reader_value || 0);
-  return { total, criteria: c, reason: c.reason || "" };
+  const overall =
+    Math.round((((Number(c.source_validation) || 0) + (Number(c.context) || 0) + (Number(c.brand_recall) || 0)) / 3) * 10) / 10;
+  return { overall, criteria: c, reason: c.reason || "" };
 }
 
-function formatScoreBreakdown({ total, criteria, reason }) {
+function formatScoreBreakdown({ overall, criteria, reason }) {
   return (
-    `Score: ${total}/10 — ${reason}\n` +
-    `  specificity ${criteria.specificity}/2 · mechanism ${criteria.mechanism}/2 · ` +
-    `territory ${criteria.territory_alignment}/2 · brand ${criteria.brand_grounding}/2 · reader value ${criteria.reader_value}/2`
+    `Score: ${overall}/10 — ${reason}\n` +
+    `  source validation ${criteria.source_validation}/10 · context ${criteria.context}/10 · brand recall ${criteria.brand_recall}/10`
   );
 }
 
 // ---------- news / sources ----------
-async function extractKeywords(text) {
-  const phrase = await callGemini(
-    `Pull 3-5 search keywords from the note below as one short search phrase (no quotes, no explanation).\n\nNOTE:\n"""\n${text}\n"""`
+// Two or three angles beat one: a note about supplier specs might have nothing in the
+// news under its own words, but plenty under the regulation or category angle.
+async function buildSearchQueries(text) {
+  const raw = await callGemini(
+    `From the founder's note below, write 3 different news-search queries that would surface genuinely relevant, citable articles for a LinkedIn post about it. Vary the angle: one on the specific topic, one on the wider industry/regulatory context, one on the Indian market angle. Each query 3-6 words, no quotes.
+
+Return ONLY the three queries, one per line, nothing else.
+
+NOTE:
+"""
+${text}
+"""`
   );
-  return phrase.replace(/["\n]/g, "").trim();
+  return raw
+    .split("\n")
+    .map((l) => l.replace(/^[-*\d.)\s]+/, "").replace(/["']/g, "").trim())
+    .filter((l) => l.length > 2)
+    .slice(0, 3);
 }
 
-async function fetchNews(query) {
-  if (!query) return null;
-  const url =
-    "https://news.google.com/rss/search?" +
-    new URLSearchParams({ q: query, hl: "en-IN", gl: "IN", ceid: "IN:en" }).toString();
-  const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (compatible; SkinstinctBot/1.0)" } });
-  if (!res.ok) return null;
-  const xml = await res.text();
-  const parser = new XMLParser({ ignoreAttributes: false });
-  let parsed;
-  try {
-    parsed = parser.parse(xml);
-  } catch {
-    return null;
-  }
-  const items = parsed?.rss?.channel?.item;
-  const first = Array.isArray(items) ? items[0] : items;
-  if (!first) return null;
-  const title = String(first.title || "").trim();
+function parseRssItem(item) {
+  const title = String(item.title || "").trim();
   const sourceFromTitle = title.includes(" - ") ? title.split(" - ").pop() : "";
-  const source = String(first.source?.["#text"] || first.source || sourceFromTitle || "").trim();
+  const source = String(item.source?.["#text"] || item.source || sourceFromTitle || "").trim();
   const headline = sourceFromTitle ? title.slice(0, title.lastIndexOf(" - ")) : title;
   return {
     title: headline,
     source,
-    date: first.pubDate ? new Date(first.pubDate).toISOString().slice(0, 10) : "",
-    link: String(first.link || "").trim(),
-    summary: String(first.description || "").replace(/<[^>]+>/g, "").trim().slice(0, 240),
+    date: item.pubDate ? new Date(item.pubDate).toISOString().slice(0, 10) : "",
+    link: String(item.link || "").trim(),
+    summary: String(item.description || "").replace(/<[^>]+>/g, "").trim().slice(0, 240),
   };
 }
 
-function verifyBlock(newsItem) {
+// Scrapes several candidate sources per query, across multiple queries, so the draft has
+// real material to work with instead of a single top hit that's usually a listicle.
+async function fetchSources(queries, perQuery = SOURCES_PER_QUERY) {
+  const collected = [];
+  const seen = new Set();
+
+  for (const query of queries.filter(Boolean)) {
+    const url =
+      "https://news.google.com/rss/search?" +
+      new URLSearchParams({ q: query, hl: "en-IN", gl: "IN", ceid: "IN:en" }).toString();
+    try {
+      const res = await fetch(url, {
+        headers: { "User-Agent": "Mozilla/5.0 (compatible; SkinstinctBot/1.0)" },
+        signal: AbortSignal.timeout(20000),
+      });
+      if (!res.ok) continue;
+      const parsed = new XMLParser({ ignoreAttributes: false }).parse(await res.text());
+      const items = parsed?.rss?.channel?.item;
+      const list = Array.isArray(items) ? items : items ? [items] : [];
+      for (const item of list.slice(0, perQuery)) {
+        const parsedItem = parseRssItem(item);
+        if (!parsedItem.title || seen.has(parsedItem.title)) continue;
+        seen.add(parsedItem.title);
+        collected.push(parsedItem);
+      }
+    } catch (e) {
+      console.error(`source fetch failed for "${query}":`, e.message);
+    }
+  }
+  return collected;
+}
+
+// Every source the bot found is listed under the post — used or not — because Meera
+// publishes under her own name and needs to check anything she cites.
+function sourcesBlock(sources, usedIndexes) {
+  if (!sources.length) return "\n\n─── SOURCES ───\nNone found for this one — the post stands on your own material.";
+  const lines = sources.map((s, i) => {
+    const mark = usedIndexes.includes(i + 1) ? "✓ cited" : "  not cited";
+    return `${mark} [${i + 1}] ${s.title}\n     ${s.source} · ${s.date}\n     ${s.link}`;
+  });
   return (
-    "\n\n─────────────────────────────────\n" +
-    `NEWS SOURCE: ${newsItem.title}\n` +
-    `FROM: ${newsItem.source} · ${newsItem.date}\n` +
-    `LINK: ${newsItem.link}\n` +
-    "⚠ Check this before publishing — you are the author of this claim\n" +
-    "─────────────────────────────────"
+    "\n\n─── SOURCES ───\n" +
+    lines.join("\n") +
+    "\n⚠ Verify anything cited before publishing — you are the author of the claim."
   );
 }
 
 // ---------- drafting ----------
-async function draftPost(note, newsItem, revisionNote) {
-  const newsBlock = newsItem
-    ? `\nA possibly-relevant current news item was found:\nHeadline: ${newsItem.title}\nSource: ${newsItem.source} · ${newsItem.date}\nSummary: ${newsItem.summary}\n\nUse it only if genuinely relevant; otherwise ignore it entirely.`
+async function draftPost(note, sources = [], revisionNote) {
+  const sourceBlock = sources.length
+    ? `\nSOURCES SCRAPED FOR THIS POST (cite by number where they genuinely strengthen the argument; ignore any that don't fit — never force one in):\n` +
+      sources.map((s, i) => `[${i + 1}] ${s.title} — ${s.source} (${s.date})\n    ${s.summary}`).join("\n")
     : "";
   const revisionBlock = revisionNote
     ? `\nThis is a REVISION. Meera's feedback on the previous draft: "${revisionNote}". Apply it directly.`
@@ -269,22 +343,30 @@ RAW NOTE:
 """
 ${note}
 """
-${newsBlock}${revisionBlock}
+${sourceBlock}${revisionBlock}
 
-Target length: ${MIN_WORDS}-${MAX_WORDS} words. No hashtags. No exclamation marks. British/Indian spelling throughout. Stay strictly grounded in the note — do not invent data or incidents.
+This note is raw thinking — it may be a half-formed musing rather than a finished argument. Your job is to find the strongest publishable angle inside it and build the post around that. If the note says she's unsure what the angle is, pick the sharpest one available and commit to it.
 
-After the post, on its own final line, write exactly one of:
-NEWS_USED: yes
-NEWS_USED: no`;
+Target length: ${MIN_WORDS}-${MAX_WORDS} words. No hashtags. No exclamation marks. British/Indian spelling throughout. Do not invent data, numbers, or incidents that aren't in the note or the sources.
+
+After the post, on its own final line, list which source numbers you actually cited:
+SOURCES_CITED: 1,3
+(or "SOURCES_CITED: none" if you cited none)`;
 
   const raw = DRAFT_PROVIDER === "claude" ? await callClaude(prompt) : await callGemini(prompt);
-  const m = raw.trim().match(/\n?NEWS_USED:\s*(yes|no)\s*$/i);
-  const newsUsed = !!(m && /yes/i.test(m[1]));
+  const m = raw.trim().match(/\n?SOURCES_CITED:\s*([^\n]*)\s*$/i);
+  const citedRaw = m ? m[1].trim() : "none";
+  const usedIndexes = /none/i.test(citedRaw)
+    ? []
+    : citedRaw
+        .split(/[,\s]+/)
+        .map((n) => parseInt(n, 10))
+        .filter((n) => Number.isInteger(n) && n >= 1 && n <= sources.length);
   const text = (m ? raw.slice(0, m.index) : raw).trim();
-  return { text, newsUsed };
+  return { text, usedIndexes };
 }
 
-function runChecks(text) {
+function runChecks(text, sourceNote = "") {
   const failed = [];
   const wordCount = text.split(/\s+/).filter(Boolean).length;
   if (wordCount < MIN_WORDS || wordCount > MAX_WORDS) {
@@ -294,8 +376,11 @@ function runChecks(text) {
   if (text.includes("!")) failed.push("contains an exclamation mark");
 
   const lower = text.toLowerCase();
+  const noteLower = sourceNote.toLowerCase();
   for (const phrase of BANNED_PHRASES) {
-    if (lower.includes(phrase)) failed.push(`wellness jargon: "${phrase}"`);
+    // If Meera used the phrase in her own note, she's discussing the term deliberately
+    // (e.g. a post critiquing "clean beauty") — flagging it would be noise.
+    if (lower.includes(phrase) && !noteLower.includes(phrase)) failed.push(`wellness jargon: "${phrase}"`);
   }
   for (const [us, gb] of Object.entries(AMERICAN_TO_BRITISH)) {
     const re = new RegExp(`\\b${us}\\b`, "i");
@@ -305,12 +390,11 @@ function runChecks(text) {
 }
 
 // ---------- persistence ----------
-async function saveNote({ chatId, text, score }) {
+async function saveNote({ chatId, text }) {
   if (!supabase) return null;
-  const status = score.total >= QUEUE_THRESHOLD ? "queued" : "rejected";
   const { data, error } = await supabase
     .from("notes")
-    .insert({ chat_id: String(chatId), text, score: score.total, reason: score.reason, status, criteria: score.criteria })
+    .insert({ chat_id: String(chatId), text, status: "queued" })
     .select()
     .single();
   if (error) console.error("saveNote failed:", error.message);
@@ -335,11 +419,19 @@ async function markNoteDrafted(noteId) {
   await supabase.from("notes").update({ status: "drafted" }).eq("id", noteId);
 }
 
-async function saveDraft({ noteId, chatId, draftText, checks }) {
+async function saveDraft({ noteId, chatId, draftText, checks, score }) {
   if (!supabase) return null;
   const { data, error } = await supabase
     .from("drafts")
-    .insert({ note_id: noteId, chat_id: String(chatId), draft_text: draftText, status: "pending", checks })
+    .insert({
+      note_id: noteId,
+      chat_id: String(chatId),
+      draft_text: draftText,
+      status: "pending",
+      checks,
+      score: score?.overall ?? null,
+      criteria: score?.criteria ?? null,
+    })
     .select()
     .single();
   if (error) console.error("saveDraft failed:", error.message);
@@ -406,49 +498,45 @@ async function queueCount(chatId) {
 
 // ---------- command handlers ----------
 
-// Shared by the auto-trigger (a qualifying note arrives) and the manual /draft
-// fallback (drafting a note that's sitting queued from before this note was drafted).
+// The full pipeline: scrape sources → draft → style checks → score the draft.
+// Every note produces a post. The score grades the output; it never blocks it.
 async function draftAndSend(chatId, note) {
-  let newsItem = null;
+  let sources = [];
   try {
-    const keywords = await extractKeywords(note.text);
-    newsItem = await fetchNews(keywords);
+    const queries = await buildSearchQueries(note.text);
+    sources = await fetchSources(queries);
+    console.log(`[${chatId}] scraped ${sources.length} source(s) from ${queries.length} queries`);
   } catch (e) {
-    console.error("news lookup failed:", e.message);
+    console.error("source scraping failed:", e.message);
   }
 
-  const { text: draft, newsUsed } = await draftPost(note.text, newsItem);
-  const checks = runChecks(draft);
-  const fullReply = draft + (newsUsed ? verifyBlock(newsItem) : "");
+  const { text: draft, usedIndexes } = await draftPost(note.text, sources);
+  const checks = runChecks(draft, note.text);
+  const score = await scoreDraft(draft, sources);
 
-  const savedDraft = await saveDraft({ noteId: note.id, chatId, draftText: fullReply, checks });
-  if (newsItem) await saveSource({ draftId: savedDraft?.id, newsItem, used: newsUsed });
+  const checksBlock = checks.length ? `\n\nStyle checks failed:\n- ${checks.join("\n- ")}` : "\n\nAll style checks passed.";
+  const fullReply = `${draft}${sourcesBlock(sources, usedIndexes)}${checksBlock}\n\n${formatScoreBreakdown(score)}\n\n— Reply APPROVE/REJECT, or /revise <feedback> to adjust.`;
+
+  const savedDraft = await saveDraft({ noteId: note.id, chatId, draftText: draft, checks, score });
+  for (const [i, source] of sources.entries()) {
+    await saveSource({ draftId: savedDraft?.id, newsItem: source, used: usedIndexes.includes(i + 1) });
+  }
   await markNoteDrafted(note.id);
 
-  const checksBlock = checks.length ? `\n\nFailed checks:\n- ${checks.join("\n- ")}` : "\n\nAll checks passed.";
-  await sendMessage(chatId, `${fullReply}${checksBlock}\n\n— Reply APPROVE/REJECT, or /revise <feedback> to adjust this draft.`);
+  await sendLongMessage(chatId, fullReply);
 }
 
-// A note IS the trigger: score it, and if it qualifies, draft it immediately — no
-// separate /draft step, no weekly cap.
+// A note IS the trigger — it always gets drafted, never rejected.
 async function handleNote(chatId, text) {
-  const score = await scoreNote(text);
-  const note = await saveNote({ chatId, text, score });
-
-  if (score.total < QUEUE_THRESHOLD) {
-    await sendMessage(chatId, `${formatScoreBreakdown(score)}\n\nNot drafted — send something with a clearer point.`);
-    return;
-  }
-  await sendMessage(chatId, formatScoreBreakdown(score));
+  const note = await saveNote({ chatId, text });
   await draftAndSend(chatId, note);
 }
 
-// Manual fallback: drafts the oldest note still sitting in "queued" status (e.g. one
-// that errored out before auto-drafting could finish). Not part of the normal flow.
+// Manual fallback for a note that errored out before its draft completed.
 async function handleDraftCommand(chatId) {
   const note = await nextQueuedNote(chatId);
   if (!note) {
-    await sendMessage(chatId, "Nothing queued — notes draft automatically as soon as they score high enough.");
+    await sendMessage(chatId, "Nothing pending — every note drafts automatically when you send it.");
     return;
   }
   await draftAndSend(chatId, note);
@@ -467,56 +555,52 @@ async function handleReviseCommand(chatId, feedback) {
   const { data: note } = supabase ? await supabase.from("notes").select("*").eq("id", draft.note_id).single() : { data: null };
   const originalNote = note?.text || draft.draft_text;
 
-  const { text: revised, newsUsed } = await draftPost(originalNote, null, feedback);
-  const checks = runChecks(revised);
-  const savedDraft = await saveDraft({ noteId: draft.note_id, chatId, draftText: revised, checks });
-  void newsUsed;
-  void savedDraft;
+  const { text: revised } = await draftPost(originalNote, [], feedback);
+  const checks = runChecks(revised, originalNote);
+  const score = await scoreDraft(revised, []);
+  await saveDraft({ noteId: draft.note_id, chatId, draftText: revised, checks, score });
 
-  const checksBlock = checks.length ? `\n\nFailed checks:\n- ${checks.join("\n- ")}` : "\n\nAll checks passed.";
-  await sendMessage(chatId, `Revised:\n\n${revised}${checksBlock}\n\n— Reply APPROVE/REJECT, or /revise again.`);
+  const checksBlock = checks.length ? `\n\nStyle checks failed:\n- ${checks.join("\n- ")}` : "\n\nAll style checks passed.";
+  await sendLongMessage(chatId, `Revised:\n\n${revised}${checksBlock}\n\n${formatScoreBreakdown(score)}\n\n— Reply APPROVE/REJECT, or /revise again.`);
 }
 
+// Scores an existing piece of text as if it were a finished post — useful for checking
+// something you've already written by hand.
 async function handleScoreCommand(chatId, text) {
-  if (text) {
-    const score = await scoreNote(text);
-    await sendMessage(chatId, `${formatScoreBreakdown(score)}\n\n(dry run — not queued)`);
+  if (!text) {
+    await sendMessage(chatId, "Usage: /score <text> — scores any post text on source validation, context and brand recall.");
     return;
   }
-  const note = await nextQueuedNote(chatId);
-  if (!note) {
-    await sendMessage(chatId, "Nothing queued. Send a note, or use /score <text> to test one without queuing it.");
-    return;
-  }
-  await sendMessage(chatId, `Next in queue:\n"${note.text.slice(0, 200)}${note.text.length > 200 ? "..." : ""}"\n\nScore: ${note.score}/10 — ${note.reason}`);
+  const score = await scoreDraft(text, []);
+  await sendMessage(chatId, formatScoreBreakdown(score));
 }
 
 async function handleQueueCommand(chatId) {
   if (!supabase) {
-    await sendMessage(chatId, "Memory layer not configured — queue isn't tracked.");
+    await sendMessage(chatId, "Memory layer not configured — nothing is tracked.");
     return;
   }
   const { data } = await supabase
     .from("notes")
-    .select("id, text, score, created_at")
+    .select("id, text, created_at")
     .eq("chat_id", String(chatId))
     .eq("status", "queued")
     .order("created_at", { ascending: true });
 
   if (!data || data.length === 0) {
-    await sendMessage(chatId, "Queue's empty.");
+    await sendMessage(chatId, "Nothing pending — every note you send gets drafted straight away.");
     return;
   }
-  const lines = data.map((n, i) => `${i + 1}. [${n.score}/10] ${n.text.slice(0, 70)}${n.text.length > 70 ? "..." : ""}`);
-  await sendMessage(chatId, `Queued (${data.length}):\n\n${lines.join("\n")}`);
+  const lines = data.map((n, i) => `${i + 1}. ${n.text.slice(0, 70)}${n.text.length > 70 ? "..." : ""}`);
+  await sendMessage(chatId, `Pending, not yet drafted (${data.length}):\n\n${lines.join("\n")}\n\nSend /draft to process.`);
 }
 
 async function handleStatusCommand(chatId) {
   const used = await draftsUsedThisWeek(chatId);
-  const queued = await queueCount(chatId);
+  const pending = await queueCount(chatId);
   await sendMessage(
     chatId,
-    `Drafts this week: ${used}\nStuck in queue (not yet auto-drafted): ${queued}\nThreshold to draft: ${QUEUE_THRESHOLD}/10\nDraft model: ${DRAFT_PROVIDER}`
+    `Drafts this week: ${used}\nPending (errored, not drafted): ${pending}\nDraft model: ${DRAFT_PROVIDER}\nScoring: source validation · context · brand recall`
   );
 }
 
@@ -545,9 +629,11 @@ async function handleUpdate(update) {
     if (text === "/start") {
       await sendMessage(
         chatId,
-        "Skinstinct content bot is live. Send a note — if it scores high enough it drafts immediately, no extra step.\n\n" +
-          "/revise <feedback> — adjust the last draft\n/score [text] — check a score without drafting\n" +
-          "/queue — any notes stuck without a draft\n/status — recent activity\n\nNothing publishes without you."
+        "Skinstinct content bot is live. Send any note — raw, half-formed, whatever. You get back:\n" +
+          "• a LinkedIn post in your voice\n• the sources it scraped (cited or not, all listed to verify)\n" +
+          "• style checks\n• a score on source validation, context and brand recall\n\n" +
+          "/revise <feedback> — adjust the last draft\n/score <text> — score any text you've written\n" +
+          "/status — recent activity\n\nEvery note gets a post. Nothing publishes without you."
       );
       return;
     }
@@ -625,4 +711,16 @@ if (isEntryPoint) {
   });
 }
 
-export { scoreNote, draftPost, runChecks, formatScoreBreakdown, draftAndSend, sendMessage, callGemini };
+export {
+  scoreDraft,
+  draftPost,
+  runChecks,
+  formatScoreBreakdown,
+  draftAndSend,
+  sendMessage,
+  sendLongMessage,
+  callGemini,
+  buildSearchQueries,
+  fetchSources,
+  sourcesBlock,
+};
