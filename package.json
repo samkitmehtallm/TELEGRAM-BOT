@@ -1,9 +1,13 @@
 {
-  "name": "skinstinct-content-engine",
+  "name": "skinstinct-content-bot",
   "version": "1.0.0",
   "private": true,
-  "description": "Telegram -> score -> news angle -> voice-matched LinkedIn draft, for Meera / Skinstinct (MESA Case 1)",
+  "description": "Telegram bot for Meera / Skinstinct: score notes, queue, draft in her voice, weekly cap — she stays the final reviewer.",
   "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
   "engines": {
     "node": ">=18"
   },

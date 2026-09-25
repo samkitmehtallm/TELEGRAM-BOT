@@ -1,98 +1,75 @@
-# Skinstinct Content Engine — MESA Case 1
+# Skinstinct Content Bot
 
-Telegram note → publishability score → news angle → LinkedIn draft in Meera's voice
-→ back to Telegram for her approval. Nothing publishes itself (Check 07, the Cut).
+A Telegram bot for Meera (Skinstinct). She drops raw notes into the chat; the bot
+scores them, queues the ones worth developing, and on `/draft` writes a LinkedIn
+post in her voice — with a news angle when one genuinely fits, and every style
+rule checked before it's shown to her. **The bot never publishes anything — Meera
+is always the final reviewer.**
 
-## What's here
+## How it works
+
+1. Send any plain-text note → scored 0–10 across five criteria (specificity,
+   mechanism, territory alignment, brand grounding, reader value). Score ≥
+   `QUEUE_THRESHOLD` (default 7) queues it; otherwise it's rejected with a reason.
+2. `/draft` — pulls the oldest queued note, looks for a relevant news angle
+   (ignored if it doesn't genuinely fit), drafts in Meera's voice, and runs it
+   through style checks (word count 350–600, no hashtags, no exclamation marks,
+   no wellness-marketing jargon, British/Indian spelling). Failed checks are
+   listed under the draft. Capped at `WEEKLY_CAP` drafts (default 3) per
+   calendar week.
+3. `/revise <feedback>` — redrafts the last post with that feedback applied.
+4. `/queue` — lists what's queued and waiting.
+5. `/score [text]` — dry-run a score without queuing, or check what's next up.
+6. `/status` — queue size, drafts used this week, current threshold/model.
+7. Reply `APPROVE` / `REJECT` to log a decision on the latest draft.
+
+## Files
 
 ```
-api/webhook.js     Telegram webhook handler — the whole pipeline
-lib/telegram.js    sendMessage() to Telegram
-lib/ai.js          scoreNote(), extractKeywords(), draftPost() — Gemini + Claude
-lib/news.js        Google News RSS lookup, no key needed
-lib/db.js          Optional Supabase memory layer (no-ops if unconfigured)
-supabase/schema.sql  notes / drafts tables for the memory layer
-voice-skill.txt    Meera's voice profile, fed to the drafting model every run
-.env.example       All the keys you need, unset
+bot.js                  Everything — long-polling loop, scoring, drafting, checks, persistence
+meera_voice_guide.txt   Meera's voice profile, fed to the drafting model every run
+supabase/schema.sql     notes / drafts / sources tables
+.env.example            All the keys/config you need, unset
 ```
 
-## 1. Fill in your keys
-
-Copy `.env.example` to `.env` (already done locally if you're reading this from the
-build) and fill in:
-
-- `TELEGRAM_BOT_TOKEN` — from BotFather
-- `GEMINI_API_KEY` — Google AI Studio (used for scoring + keyword extraction, and
-  for drafting if `DRAFT_PROVIDER=gemini`)
-- `ANTHROPIC_API_KEY` — used for drafting when `DRAFT_PROVIDER=claude` (default,
-  matches B1: Claude holds voice better across a full post)
-- `SUPABASE_URL` / `SUPABASE_KEY` — optional, only needed for the B1·3 memory layer
-
-`.env` is gitignored. Never commit it.
-
-## 2. Push to GitHub
+## Setup
 
 ```bash
-cd skinstinct-content-engine
-git init
-git add -A
-git commit -m "Skinstinct content engine — Case 1"
-gh repo create skinstinct-content-engine --private --source=. --push
+npm install
+cp .env.example .env   # fill in your keys
+npm start               # runs bot.js — a long-lived process, not a serverless function
 ```
 
-(No `gh`? Create an empty repo on github.com, then `git remote add origin <url>` and
-`git push -u origin main`.)
+Required: `TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`. Optional: `ANTHROPIC_API_KEY`
+(only if `DRAFT_PROVIDER=claude`), `SUPABASE_URL` + `SUPABASE_KEY` (memory layer —
+without these the bot still works, it just doesn't persist anything).
 
-## 3. Deploy on Vercel
+## Why long-polling, not a webhook
 
-1. vercel.com → Add New → Project → import the GitHub repo
-2. Before deploying, open **Environment Variables** and add every key from your
-   `.env` file — exactly as they appear there
-3. Deploy. Copy the resulting URL (`https://your-project.vercel.app`)
+This bot polls Telegram directly (`getUpdates` in a loop) instead of registering
+a webhook, so it needs a process that stays running — your machine, a small VPS,
+or a host like Railway/Render. It will **not** run on Vercel or any serverless
+platform, since those don't keep a process alive between requests. If you'd
+rather run this as a webhook on Vercel instead, the loop in `bot.js` (`main()` /
+`getUpdates`) is the only part that would need to change — the scoring, drafting,
+and persistence logic underneath is otherwise the same either way.
 
-## 4. Point Telegram at your deployment
+## Memory layer
 
-In a browser, visit (fill in your own token and URL):
+Run `supabase/schema.sql` in your Supabase project's SQL editor, then set
+`SUPABASE_URL` / `SUPABASE_KEY`. Tables:
 
-```
-https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=<YOUR_VERCEL_URL>/api/webhook
-```
-
-You should see `"ok":true`. If not: check for stray spaces in the token, and make
-sure the Vercel URL is from a completed deployment, not a preview.
-
-## 5. Memory layer (optional, B1·3)
-
-Run `supabase/schema.sql` in your Supabase project's SQL editor, then add
-`SUPABASE_URL` / `SUPABASE_KEY` to Vercel's env vars and redeploy. Without these set,
-the pipeline runs exactly the same — it just doesn't persist notes/drafts.
-
-## 6. Test
-
-Send a real note (from `notes/`, or your own) to the bot on Telegram.
-
-- **Strong note** (a clear point, an observation, a number) → score 6+ → a draft
-  comes back with a verify block if a news item was used
-- **Weak note** (a reminder, a stray half-thought) → score below threshold → a short
-  rejection message, no draft
-
-Reply `APPROVE` or `REJECT` to log a decision on the most recent draft in that chat.
-
-## Model split (why two providers)
-
-| Task | Model | Why |
-|---|---|---|
-| Scoring notes | Gemini Flash | fast, cheap, no real judgment needed |
-| Keyword extraction | Gemini Flash | fast, cheap, mechanical |
-| Drafting the post | Claude (`DRAFT_PROVIDER=claude`) | holds voice consistently across a full post |
-| Drafting (L3 fallback) | Gemini (`DRAFT_PROVIDER=gemini`) | for parity with the L3 demo if Claude key isn't set yet |
-
-Swap `DRAFT_PROVIDER` in `.env` / Vercel env vars to compare the two on the same note.
+- `notes` — every note scored, with its 5-criteria breakdown and `status`
+  (`queued` / `rejected` / `drafted`)
+- `drafts` — generated posts, with `status` (`pending` / `approved` / `rejected`)
+  and the style-check results
+- `sources` — every news item surfaced per draft, with `used_in_draft` flagging
+  whether it was actually cited or correctly set aside
 
 ## The boundary this respects
 
-Check 07 (Judgment Protected) failed on purpose — Meera passed on two consultants who
-offered end-to-end automation. This pipeline drafts; it never posts. Every draft that
-used a news item carries an explicit `⚠ Check this before publishing` block, because a
-fact published under her name that she hasn't verified is the exact failure this
+Nothing here posts to LinkedIn. The riskiest thing this bot can do is hand Meera
+a bad draft she rejects — not publish something under her name she hasn't seen.
+Any draft that cites a news source carries an explicit verify block, because a
+fact published in her name that she hasn't checked is the exact failure this
 exists to prevent.

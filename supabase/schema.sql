@@ -13,6 +13,8 @@ create table if not exists notes (
   text text not null,
   score numeric,
   reason text,
+  status text not null default 'queued', -- queued | rejected | drafted
+  criteria jsonb,                        -- {specificity, mechanism, territory_alignment, brand_grounding, reader_value}
   created_at timestamptz not null default now()
 );
 
@@ -22,12 +24,12 @@ create table if not exists drafts (
   chat_id text not null,
   draft_text text not null,
   status text not null default 'pending', -- pending | approved | rejected
+  checks jsonb,                            -- list of failed style checks, e.g. word count / hashtags / spelling
   created_at timestamptz not null default now()
 );
 
--- One row per news source surfaced for a draft (not just the one used) — this is the
--- "sources" store: the integrated, citable data behind every post, kept even when a
--- source was found but the model correctly chose not to cite it.
+-- One row per news source surfaced for a draft (not just the one used) — kept even
+-- when a source was found but correctly not cited, so the triage is auditable.
 create table if not exists sources (
   id bigint generated always as identity primary key,
   draft_id bigint references drafts (id) on delete cascade,
@@ -41,6 +43,7 @@ create table if not exists sources (
 );
 
 create index if not exists idx_notes_chat_id on notes (chat_id);
+create index if not exists idx_notes_status_chat on notes (chat_id, status);
 create index if not exists idx_drafts_chat_id_status on drafts (chat_id, status);
 create index if not exists idx_sources_draft_id on sources (draft_id);
 
