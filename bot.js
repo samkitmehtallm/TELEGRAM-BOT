@@ -1,6 +1,6 @@
 // Skinstinct content bot — Telegram long-polling bot for Meera.
-// Notes come in as plain text, get scored on a 5-criteria rubric, and queue up.
-// /draft pulls the next queued note (capped weekly) and drafts it in Meera's voice.
+// A note IS the trigger: it's scored on a 5-criteria rubric, and if it qualifies,
+// drafted immediately in Meera's voice — no separate /draft step, no cap.
 // Nothing ever reaches LinkedIn from here — Meera is always the final reviewer.
 
 import { readFileSync } from "fs";
@@ -14,8 +14,7 @@ const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || "";
 const DRAFT_PROVIDER = (process.env.DRAFT_PROVIDER || "gemini").toLowerCase();
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-5";
-const QUEUE_THRESHOLD = Number(process.env.QUEUE_THRESHOLD || 7); // out of 10
-const WEEKLY_CAP = Number(process.env.WEEKLY_CAP || 3); // matches Meera's "3 posts/week" target
+const QUEUE_THRESHOLD = Number(process.env.QUEUE_THRESHOLD || 7); // out of 10 — drafts immediately once met, no cap
 const MIN_WORDS = 350;
 const MAX_WORDS = 600;
 
@@ -364,30 +363,10 @@ async function queueCount(chatId) {
 }
 
 // ---------- command handlers ----------
-async function handleNote(chatId, text) {
-  const score = await scoreNote(text);
-  const note = await saveNote({ chatId, text, score });
 
-  if (score.total < QUEUE_THRESHOLD) {
-    await sendMessage(chatId, `${formatScoreBreakdown(score)}\n\nNot queued — send something with a clearer point.`);
-    return;
-  }
-  await sendMessage(chatId, `${formatScoreBreakdown(score)}\n\nQueued. Send /draft when you're ready, or /queue to see what's waiting.`);
-  void note; // note already persisted with status "queued"
-}
-
-async function handleDraftCommand(chatId) {
-  const used = await draftsUsedThisWeek(chatId);
-  if (used >= WEEKLY_CAP) {
-    await sendMessage(chatId, `Weekly cap reached (${used}/${WEEKLY_CAP}). Next slot opens Monday.`);
-    return;
-  }
-  const note = await nextQueuedNote(chatId);
-  if (!note) {
-    await sendMessage(chatId, "Queue's empty — send a note first.");
-    return;
-  }
-
+// Shared by the auto-trigger (a qualifying note arrives) and the manual /draft
+// fallback (drafting a note that's sitting queued from before this note was drafted).
+async function draftAndSend(chatId, note) {
   let newsItem = null;
   try {
     const keywords = await extractKeywords(note.text);
@@ -405,10 +384,32 @@ async function handleDraftCommand(chatId) {
   await markNoteDrafted(note.id);
 
   const checksBlock = checks.length ? `\n\nFailed checks:\n- ${checks.join("\n- ")}` : "\n\nAll checks passed.";
-  await sendMessage(
-    chatId,
-    `Draft ${used + 1}/${WEEKLY_CAP} this week:\n\n${fullReply}${checksBlock}\n\n— Reply APPROVE/REJECT, or /revise <feedback> to adjust this draft.`
-  );
+  await sendMessage(chatId, `${fullReply}${checksBlock}\n\n— Reply APPROVE/REJECT, or /revise <feedback> to adjust this draft.`);
+}
+
+// A note IS the trigger: score it, and if it qualifies, draft it immediately — no
+// separate /draft step, no weekly cap.
+async function handleNote(chatId, text) {
+  const score = await scoreNote(text);
+  const note = await saveNote({ chatId, text, score });
+
+  if (score.total < QUEUE_THRESHOLD) {
+    await sendMessage(chatId, `${formatScoreBreakdown(score)}\n\nNot drafted — send something with a clearer point.`);
+    return;
+  }
+  await sendMessage(chatId, formatScoreBreakdown(score));
+  await draftAndSend(chatId, note);
+}
+
+// Manual fallback: drafts the oldest note still sitting in "queued" status (e.g. one
+// that errored out before auto-drafting could finish). Not part of the normal flow.
+async function handleDraftCommand(chatId) {
+  const note = await nextQueuedNote(chatId);
+  if (!note) {
+    await sendMessage(chatId, "Nothing queued — notes draft automatically as soon as they score high enough.");
+    return;
+  }
+  await draftAndSend(chatId, note);
 }
 
 async function handleReviseCommand(chatId, feedback) {
@@ -473,7 +474,7 @@ async function handleStatusCommand(chatId) {
   const queued = await queueCount(chatId);
   await sendMessage(
     chatId,
-    `Drafts this week: ${used}/${WEEKLY_CAP}\nQueued notes: ${queued}\nThreshold to queue: ${QUEUE_THRESHOLD}/10\nDraft model: ${DRAFT_PROVIDER}`
+    `Drafts this week: ${used}\nStuck in queue (not yet auto-drafted): ${queued}\nThreshold to draft: ${QUEUE_THRESHOLD}/10\nDraft model: ${DRAFT_PROVIDER}`
   );
 }
 
@@ -501,9 +502,9 @@ async function handleUpdate(update) {
   if (text === "/start") {
     await sendMessage(
       chatId,
-      "Skinstinct content bot is live. Send a note and I'll score it. Once it's queued:\n" +
-        "/draft — draft the next queued note\n/queue — see what's waiting\n/score [text] — check a score without queuing\n" +
-        "/revise <feedback> — adjust the last draft\n/status — queue + weekly cap\n\nNothing publishes without you."
+      "Skinstinct content bot is live. Send a note — if it scores high enough it drafts immediately, no extra step.\n\n" +
+        "/revise <feedback> — adjust the last draft\n/score [text] — check a score without drafting\n" +
+        "/queue — any notes stuck without a draft\n/status — recent activity\n\nNothing publishes without you."
     );
     return;
   }

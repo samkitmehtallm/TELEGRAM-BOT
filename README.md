@@ -1,26 +1,27 @@
 # Skinstinct Content Bot
 
-A Telegram bot for Meera (Skinstinct). She drops raw notes into the chat; the bot
-scores them, queues the ones worth developing, and on `/draft` writes a LinkedIn
-post in her voice — with a news angle when one genuinely fits, and every style
-rule checked before it's shown to her. **The bot never publishes anything — Meera
-is always the final reviewer.**
+A Telegram bot for Meera (Skinstinct). She drops a raw note into the chat — that
+note is the trigger. If it scores well enough, the bot immediately finds a news
+angle (only if one genuinely fits), drafts a LinkedIn post in her voice, and runs
+every style rule before showing it to her. No separate command, no cap on how
+many per week. **The bot never publishes anything — Meera is always the final
+reviewer.**
 
 ## How it works
 
 1. Send any plain-text note → scored 0–10 across five criteria (specificity,
-   mechanism, territory alignment, brand grounding, reader value). Score ≥
-   `QUEUE_THRESHOLD` (default 7) queues it; otherwise it's rejected with a reason.
-2. `/draft` — pulls the oldest queued note, looks for a relevant news angle
-   (ignored if it doesn't genuinely fit), drafts in Meera's voice, and runs it
-   through style checks (word count 350–600, no hashtags, no exclamation marks,
-   no wellness-marketing jargon, British/Indian spelling). Failed checks are
-   listed under the draft. Capped at `WEEKLY_CAP` drafts (default 3) per
-   calendar week.
+   mechanism, territory alignment, brand grounding, reader value).
+2. Score ≥ `QUEUE_THRESHOLD` (default 7) → drafted immediately: a relevant news
+   angle is looked for (ignored if it doesn't genuinely fit), the post is drafted
+   in Meera's voice, and it's run through style checks (word count 350–600, no
+   hashtags, no exclamation marks, no wellness-marketing jargon, British/Indian
+   spelling). Failed checks are listed under the draft. No weekly limit.
+   Score < threshold → rejected with a one-line reason, nothing drafted.
 3. `/revise <feedback>` — redrafts the last post with that feedback applied.
-4. `/queue` — lists what's queued and waiting.
-5. `/score [text]` — dry-run a score without queuing, or check what's next up.
-6. `/status` — queue size, drafts used this week, current threshold/model.
+4. `/score [text]` — dry-run a score without drafting.
+5. `/queue` — lists any notes that scored high enough but, unusually, didn't
+   auto-draft (e.g. a transient error) — `/draft` picks up from there manually.
+6. `/status` — drafts sent this week, current threshold/model.
 7. Reply `APPROVE` / `REJECT` to log a decision on the latest draft.
 
 ## Files
