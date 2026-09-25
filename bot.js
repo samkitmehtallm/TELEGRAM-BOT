@@ -537,13 +537,21 @@ async function handleUpdate(update) {
 }
 
 // ---------- long-polling loop ----------
+// Telegram's own long-poll timeout is TG_POLL_TIMEOUT seconds; the client-side abort
+// must sit comfortably above that, or a client abort can race Telegram's server-side
+// connection teardown and produce a self-inflicted 409 ("terminated by other getUpdates
+// request") on the very next call — the bot conflicting with its own previous request.
+const TG_POLL_TIMEOUT = 20; // seconds Telegram holds the connection open
+const CLIENT_ABORT_MS = 50000; // well above TG_POLL_TIMEOUT, generous margin for network jitter
+
 async function getUpdates(offset) {
-  const params = new URLSearchParams({ timeout: "25" });
+  const params = new URLSearchParams({ timeout: String(TG_POLL_TIMEOUT) });
   if (offset !== undefined) params.set("offset", String(offset));
   const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?${params}`, {
-    signal: AbortSignal.timeout(35000),
+    signal: AbortSignal.timeout(CLIENT_ABORT_MS),
   });
   const data = await res.json();
+  if (!data.ok) throw new Error(`getUpdates failed: ${data.error_code} ${data.description}`);
   return data.result || [];
 }
 
@@ -555,8 +563,12 @@ async function main() {
     try {
       updates = await getUpdates(offset);
     } catch (e) {
-      console.error("poll error (recovered):", e.message);
-      await new Promise((r) => setTimeout(r, 3000));
+      // A timeout/abort/409 means a connection may still be settling server-side —
+      // give it real time to clear instead of immediately reconnecting into it.
+      const isConflict = /409|conflict/i.test(e.message);
+      const delay = isConflict ? 8000 : 4000;
+      console.error(`poll error (recovered, retrying in ${delay}ms):`, e.message);
+      await new Promise((r) => setTimeout(r, delay));
       continue;
     }
     for (const upd of updates) {
