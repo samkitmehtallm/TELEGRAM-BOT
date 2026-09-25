@@ -3,7 +3,8 @@
 // drafted immediately in Meera's voice — no separate /draft step, no cap.
 // Nothing ever reaches LinkedIn from here — Meera is always the final reviewer.
 
-import { readFileSync } from "fs";
+import { readFileSync, realpathSync } from "fs";
+import { fileURLToPath } from "url";
 import { createClient } from "@supabase/supabase-js";
 import { XMLParser } from "fast-xml-parser";
 
@@ -12,7 +13,13 @@ const BOT_TOKEN = requireEnv("TELEGRAM_BOT_TOKEN");
 const GEMINI_KEY = requireEnv("GEMINI_API_KEY");
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || "";
 const DRAFT_PROVIDER = (process.env.DRAFT_PROVIDER || "gemini").toLowerCase();
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
+// Ordered fallback chain. The "-latest" aliases get congested in bursts (503) and the
+// free tier exhausts quota on pro models (429) — so a single model is a single point of
+// failure. Tried in order; first one that answers wins.
+const GEMINI_MODELS = (process.env.GEMINI_MODELS || "gemini-flash-latest,gemini-flash-lite-latest")
+  .split(",")
+  .map((m) => m.trim())
+  .filter(Boolean);
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-5";
 const QUEUE_THRESHOLD = Number(process.env.QUEUE_THRESHOLD || 7); // out of 10 — drafts immediately once met, no cap
 const MIN_WORDS = 350;
@@ -91,25 +98,49 @@ const sendMessage = (chatId, text) =>
 // ---------- Gemini / Claude ----------
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 
-async function callGemini(prompt, attempt = 1) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`;
+async function callGeminiModel(model, prompt) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`;
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+    signal: AbortSignal.timeout(60000),
   });
   if (!res.ok) {
-    const body = await res.text();
-    if (RETRYABLE_STATUS.has(res.status) && attempt < 3) {
-      const delay = attempt * 1500; // 1.5s, then 3s
-      console.error(`Gemini ${res.status} (attempt ${attempt}), retrying in ${delay}ms...`);
-      await new Promise((r) => setTimeout(r, delay));
-      return callGemini(prompt, attempt + 1);
-    }
-    throw new Error(`Gemini call failed after ${attempt} attempt(s): ${res.status} ${body}`);
+    const err = new Error(`${res.status} ${(await res.text()).slice(0, 200)}`);
+    err.status = res.status;
+    throw err;
   }
   const data = await res.json();
   return (data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+}
+
+// Walks the model chain: retries a model while its errors look transient, then falls
+// through to the next model. A 404 (model not available on this key) is skipped at once.
+async function callGemini(prompt) {
+  const failures = [];
+  for (const model of GEMINI_MODELS) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        return await callGeminiModel(model, prompt);
+      } catch (e) {
+        const status = e.status;
+        if (status === 404) {
+          failures.push(`${model}: not available`);
+          break; // no point retrying a model this key can't see
+        }
+        const retryable = status === undefined || RETRYABLE_STATUS.has(status);
+        if (retryable && attempt < 2) {
+          console.error(`Gemini ${model} ${status || "network"} (attempt ${attempt}), retrying...`);
+          await new Promise((r) => setTimeout(r, 1500));
+          continue;
+        }
+        failures.push(`${model}: ${e.message.split("\n")[0]}`);
+        break; // move on to the next model in the chain
+      }
+    }
+  }
+  throw new Error(`All Gemini models failed — ${failures.join(" | ")}`);
 }
 
 async function callClaude(prompt, maxTokens = 1400) {
@@ -582,7 +613,16 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  console.error("Fatal error, bot stopped:", e);
-  process.exit(1);
-});
+// Only start polling when run directly (`node bot.js`). Importing this file — for a
+// one-off test of the real scoring/drafting path — must not open a second long-poll
+// connection, since Telegram allows only one per bot and the two would conflict.
+const isEntryPoint = process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isEntryPoint) {
+  main().catch((e) => {
+    console.error("Fatal error, bot stopped:", e);
+    process.exit(1);
+  });
+}
+
+export { scoreNote, draftPost, runChecks, formatScoreBreakdown, draftAndSend, sendMessage, callGemini };
